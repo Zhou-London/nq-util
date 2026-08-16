@@ -1,4 +1,4 @@
-# python-util
+# util
 
 Host-side Python utilities for the trading stack, run with [uv](https://docs.astral.sh/uv/).
 Each script carries its own PEP 723 dependency block; no shared project file.
