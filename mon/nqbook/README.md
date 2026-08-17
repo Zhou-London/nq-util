@@ -7,6 +7,8 @@ the page keeps a rolling minute of samples and differences the cumulative
 counters into rates client-side. White surface, one blue for every series;
 status colors mark only the connection state and the dropped counter.
 
+![The dashboard on a live Kraken feed](docs/dashboard.png)
+
 ```bash
 npm install
 npm run dev                  # http://localhost:3000
