@@ -6,7 +6,7 @@
 
 Each message is framed as nqbook's RunFeed expects: one tag byte (0 = order,
 1 = trade), then the record in nlib::order host layout. Only `seq` and
-`time_ns` change between sends.
+`event_ns` change between sends.
 """
 
 import argparse
@@ -17,15 +17,16 @@ import zmq
 
 ORDER_TAG = 0
 
-# nlib::order, little-endian LP64: seq, order_id, price, qty, time_ns (int64),
-# prev, next (uint64, zeroed; ignored on receive), instrument_id (uint32),
-# side, type, action (uint8), one pad byte.
-ORDER_FORMAT = struct.Struct("<qqqqqQQIBBBx")
-assert ORDER_FORMAT.size == 64
+# nlib::order, little-endian LP64: seq, order_id, price, qty, event_ns
+# (int64), prev, next (uint64, zeroed; ignored on receive), instrument_id
+# (uint32), side, type, action (uint8), one pad byte, recv_ns (int64, zeroed;
+# stamped by the receiver).
+ORDER_FORMAT = struct.Struct("<qqqqqQQIBBBxq")
+assert ORDER_FORMAT.size == 72
 
 ORDER_ID = 1
-PRICE = 1_001_000  # 100.10 at nlib::price_scale (1/10000)
-QTY = 10
+PRICE = 1_001_000_000_000  # 100.10 at nlib::price_scale (1/1e10)
+QTY = 1_000_000_000  # 10 at nlib::qty_scale (1/1e8)
 INSTRUMENT_ID = 1
 SIDE_BUY = 0
 TYPE_LIMIT = 0
@@ -61,6 +62,7 @@ def main() -> None:
                 SIDE_BUY,
                 TYPE_LIMIT,
                 ACTION_ADD,
+                0,
             )
             pub.send(bytes([ORDER_TAG]) + payload)
             time.sleep(args.interval)
