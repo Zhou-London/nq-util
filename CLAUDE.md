@@ -13,6 +13,7 @@ dependencies and is built its own way. See [README.md](README.md).
 ```
 feed_sim.py       ZMQ publisher that feeds nqbook a repeated virtual order
 md/kraken/        Rust: normalizes Kraken's spot level3 feed onto the nlib wire and publishes it over ZMQ
+mon/nqbook/       Next.js: live dashboard over nqbook's nlib::metrics ZMQ stream
 ```
 
 Everything here runs on the **host**, not in the `dev` container — that is what

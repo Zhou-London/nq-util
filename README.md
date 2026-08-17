@@ -47,6 +47,19 @@ event onto the nlib wire, and publishes the framed records over ZMQ for
 cd md/kraken && cargo run --release   # PUB on tcp://0.0.0.0:5555
 ```
 
+## Node
+
+### mon/nqbook
+
+Live dashboard for `nqbook`: a Next.js route bridges the service's
+`nlib::metrics` ZMQ stream to the browser over SSE, and the page renders a
+rolling minute of throughput, apply latency, and book gauges at the stream's
+10 Hz. See [mon/nqbook/README.md](mon/nqbook/README.md).
+
+```bash
+cd mon/nqbook && npm install && npm run dev   # http://localhost:3000
+```
+
 ## Releases
 
 ### 2026-08-16
