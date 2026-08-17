@@ -1,5 +1,5 @@
-//! Selects which pairs to subscribe to: every online spot pair whose base is
-//! a cryptoasset, over any quote currency, ranked by activity.
+//! Ranks every online spot pair whose base is a cryptoasset, over any quote
+//! currency, by activity; the subscription takes the head of that ranking.
 
 use std::collections::HashMap;
 
@@ -36,9 +36,10 @@ struct Ticker {
     t: [u64; 2],
 }
 
-/// Returns the online crypto spot pairs as websocket names, most actively
-/// traded first by 24-hour trade count, all of them when `limit` is None.
-pub async fn select(http: &reqwest::Client, limit: Option<usize>) -> Result<Vec<String>> {
+/// Returns the `limit` most active online crypto spot pairs as websocket
+/// names, most actively traded first by 24-hour trade count. The whole
+/// market is ranked; `limit` only truncates.
+pub async fn select(http: &reqwest::Client, limit: usize) -> Result<Vec<String>> {
     let pairs: HashMap<String, AssetPair> = get(http, "/0/public/AssetPairs").await?;
     let tickers: HashMap<String, Ticker> = get(http, "/0/public/Ticker").await?;
 
@@ -60,9 +61,7 @@ pub async fn select(http: &reqwest::Client, limit: Option<usize>) -> Result<Vec<
         bail!("no tradeable pairs found");
     }
     ranked.sort_unstable_by(|a, b| b.cmp(a));
-    if let Some(limit) = limit {
-        ranked.truncate(limit);
-    }
+    ranked.truncate(limit);
     Ok(ranked.into_iter().map(|(_, name)| name).collect())
 }
 

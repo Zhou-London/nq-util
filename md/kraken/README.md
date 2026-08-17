@@ -1,14 +1,15 @@
 # kraken
 
-Reads Kraken's spot `level3` (L3 orders) websocket feed — every online crypto
-pair by default — normalizes each order event onto the nlib wire, and
-publishes the framed records on a ZMQ PUB socket for `nqbook`'s feed thread.
-Nothing is persisted here; persistence is `nqbook`'s writer stage.
+Reads Kraken's spot `level3` (L3 orders) websocket feed for the most actively
+traded crypto pairs — 35 by default, over one connection — normalizes each
+order event onto the nlib wire, and publishes the framed records on a ZMQ PUB
+socket for `nqbook`'s feed thread. Nothing is persisted here; persistence is
+`nqbook`'s writer stage.
 
 ```bash
-cargo run --release                    # all pairs, depth 10, PUB on tcp://0.0.0.0:5555
+cargo run --release                    # top 35 pairs, depth 10, PUB on tcp://0.0.0.0:5555
 cargo run --release -- --list-symbols  # print instrument_id,symbol and exit
-cargo run --release -- --symbols 200 --depth 100 --endpoint tcp://0.0.0.0:6000
+cargo run --release -- --symbols 40 --endpoint tcp://0.0.0.0:6000
 ```
 
 ## Normalization
@@ -66,28 +67,26 @@ is fetched per connection attempt.
 
 ## Which symbols
 
-All online spot pairs offered over websocket whose base is a cryptoasset —
-about 1330 — over every quote currency; FX crosses like `EUR/USD` are
-excluded. `--symbols N` keeps the N most active, ranked by 24-hour trade
-count from `/0/public/Ticker`: unlike volume, which is priced in each pair's
-own quote currency, a trade count compares across quotes.
+The whole market is ranked — every online spot pair offered over websocket
+whose base is a cryptoasset (about 1330; FX crosses like `EUR/USD` are
+excluded), by 24-hour trade count from `/0/public/Ticker`, which unlike
+volume compares across quote currencies — and the subscription takes the top
+`--symbols` of it.
 
-## Connections and rate limits
+## The connection and rate limits
 
-Kraken caps a websocket connection at 200 symbols, so the full list shards
-across seven connections. Subscriptions are rate limited by a counter that a
-depth-10 symbol increments by 5, depth 100 by 25 and depth 1000 by 100,
-against a budget of 200 per second on the standard tier (500 on pro) — and
-the budget belongs to the account, not the connection. Subscribe requests are
-therefore batched to cost at most half that budget and paced through one
-global one-batch-per-second gate shared by every connection, sent from a task
-separate from the reader so snapshots arriving mid-subscribe cannot stall the
-socket. The full subscription takes about 70 seconds to spread out.
+One websocket connection, one subscribe request. Subscriptions are rate
+limited account-wide by a counter that a depth-10 symbol increments by 5
+(depth 100 by 25, depth 1000 by 100) against a budget of 200 per second on
+the standard tier, 500 on pro. That budget is what caps `--symbols`: the
+default 35 costs 175 and fits the standard tier in one request; a pro tier
+fits 100; Kraken caps a connection at 200 symbols regardless. Raise the flag
+as the account's tier allows.
 
 A connection that errors or goes 20 seconds without a message — Kraken
 heartbeats about once a second when idle, so silence means a dead connection —
-is dropped and reconnected with capped exponential backoff, resubscribing
-through the same gate and replaying fresh snapshots.
+is dropped and reconnected with capped exponential backoff, replaying a
+fresh snapshot per symbol.
 
 ## Reference
 

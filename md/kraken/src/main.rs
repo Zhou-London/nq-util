@@ -1,7 +1,7 @@
-//! Reads Kraken's spot `level3` (L3 orders) websocket feed — every online
-//! crypto pair by default — normalizes each order event onto the nlib wire,
-//! and publishes the framed records on a ZMQ PUB socket for nqbook's feed
-//! thread.
+//! Reads Kraken's spot `level3` (L3 orders) websocket feed for the most
+//! actively traded crypto pairs, normalizes each order event onto the nlib
+//! wire, and publishes the framed records on a ZMQ PUB socket for nqbook's
+//! feed thread.
 
 mod auth;
 mod feed;
@@ -18,17 +18,19 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::auth::Credentials;
-use crate::feed::{MAX_SYMBOLS_PER_CONNECTION, Shared, SubscribePacer};
+use crate::feed::Shared;
 use crate::stats::Stats;
 
 #[derive(Parser)]
 #[command(about, version)]
 struct Args {
-    /// Subscribe to only the N most active pairs; every online crypto pair
-    /// when omitted. Kraken allows 200 symbols per connection, so more
-    /// symbols open more connections.
-    #[arg(long)]
-    symbols: Option<usize>,
+    /// How many of the most active pairs to subscribe to, over one
+    /// connection. The subscribe request costs 5 rate-limit points per
+    /// symbol at depth 10 against a budget of 200 per second (standard
+    /// tier; 500 on pro), so the tier caps how high this can go; Kraken
+    /// caps a connection at 200 symbols regardless.
+    #[arg(long, default_value_t = 35, value_parser = clap::value_parser!(u16).range(1..=200))]
+    symbols: u16,
 
     /// Book depth per symbol; Kraken accepts 10, 100 or 1000.
     #[arg(long, default_value_t = 10, value_parser = parse_depth)]
@@ -63,8 +65,8 @@ async fn main() -> Result<()> {
         .build()
         .context("build http client")?;
 
-    let selected = symbols::select(&http, args.symbols).await?;
-    eprintln!("selected {} online crypto pairs", selected.len());
+    let selected = symbols::select(&http, args.symbols as usize).await?;
+    eprintln!("selected the {} most active crypto pairs", selected.len());
     if args.list_symbols {
         for symbol in &selected {
             println!("{},{symbol}", wire::instrument_id(symbol));
@@ -72,8 +74,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Prove the key works before spawning connections, so a bad credential
-    // fails here with Kraken's own message instead of becoming a retry loop.
+    // Prove the key works before connecting, so a bad credential fails here
+    // with Kraken's own message instead of becoming a retry loop.
     let creds = Credentials::load()?;
     auth::websockets_token(&http, &creds)
         .await
@@ -84,30 +86,24 @@ async fn main() -> Result<()> {
         creds,
         http,
         stats: Stats::default(),
-        pacer: SubscribePacer::new(),
         seq: AtomicI64::new(0),
         frames: frames_tx,
     });
 
     let publisher = tokio::spawn(publish::run(args.endpoint, frames_rx, Arc::clone(&shared)));
-
-    let mut connections = tokio::task::JoinSet::new();
-    for (id, shard) in selected.chunks(MAX_SYMBOLS_PER_CONNECTION).enumerate() {
-        connections.spawn(feed::run(
-            id,
-            Arc::new(shard.to_vec()),
-            args.depth,
-            Arc::clone(&shared),
-        ));
-    }
+    let connection = tokio::spawn(feed::run(
+        Arc::new(selected),
+        args.depth,
+        Arc::clone(&shared),
+    ));
 
     let reporter = tokio::spawn(report(Arc::clone(&shared), args.report_interval));
 
-    // Connections retry forever, so a publisher failure, a panic, or Ctrl-C
-    // ends the run.
+    // The connection retries forever, so a publisher failure, a panic, or
+    // Ctrl-C ends the run.
     let result = tokio::select! {
         outcome = publisher => outcome.context("publisher panicked")?,
-        Some(outcome) = connections.join_next() => outcome.context("connection task panicked"),
+        outcome = connection => outcome.context("connection task panicked"),
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
 

@@ -1,4 +1,4 @@
-//! One websocket connection: subscribe to `level3`, normalize every order
+//! The websocket connection: subscribe to `level3`, normalize every order
 //! event onto the nlib wire, and hand the frames to the publisher.
 //!
 //! Normalization: bids are buys and asks sells; a snapshot replays as a
@@ -7,9 +7,8 @@
 //! priority kept), delete -> `Cancel` (the order leaves the book). Prices and
 //! quantities are parsed from the raw JSON text into fixed point, ids and
 //! symbols hash to the wire's integer ids, and `seq` is assigned from one
-//! process-wide counter, so the ZMQ stream is a single ordered feed. An order
-//! whose fields fail to normalize is skipped and counted, never sent
-//! half-formed.
+//! counter, so the ZMQ stream is a single ordered feed. An order whose
+//! fields fail to normalize is skipped and counted, never sent half-formed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -19,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -29,9 +28,6 @@ use crate::wire::{self, Frame};
 
 /// `level3` lives on its own endpoint, not the general authenticated one.
 const WS_URL: &str = "wss://ws-l3.kraken.com/v2";
-
-/// Kraken caps a connection at 200 symbols; more requires more connections.
-pub const MAX_SYMBOLS_PER_CONNECTION: usize = 200;
 
 /// Kraken sends a heartbeat about once a second when no channel is updating,
 /// so silence this long means the connection is dead however healthy the
@@ -46,56 +42,21 @@ const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 /// outage left off.
 const HEALTHY_SESSION: Duration = Duration::from_secs(120);
 
-/// A subscription's rate-limit cost, per symbol, by book depth. The budget is
-/// 200 per second on the standard tier (500 on pro) and is account-wide, so
-/// spending it is paced globally by [`SubscribePacer`].
-fn subscribe_cost(depth: u32) -> u32 {
-    match depth {
-        10 => 5,
-        100 => 25,
-        _ => 100,
-    }
-}
-
-/// State shared by every connection.
+/// State shared between the connection and the publisher.
 pub struct Shared {
     pub creds: Credentials,
     pub http: reqwest::Client,
     pub stats: Stats,
-    pub pacer: SubscribePacer,
-    /// Feed sequence numbers, one stream across all connections.
+    /// Feed sequence numbers.
     pub seq: AtomicI64,
     /// Framed records bound for the publisher.
     pub frames: mpsc::Sender<Frame>,
 }
 
-/// Grants one subscribe batch per second across every connection. Batches
-/// are sized to cost at most half the standard tier's per-second budget, and
-/// the budget is shared by the whole account — per-connection pacing would
-/// multiply the spend by the connection count.
-pub struct SubscribePacer(Mutex<Instant>);
-
-impl SubscribePacer {
-    pub fn new() -> Self {
-        Self(Mutex::new(Instant::now()))
-    }
-
-    /// Waits for this caller's slot; slots are one second apart globally.
-    async fn wait(&self) {
-        let at = {
-            let mut next = self.0.lock().await;
-            let at = (*next).max(Instant::now());
-            *next = at + Duration::from_secs(1);
-            at
-        };
-        tokio::time::sleep_until(at).await;
-    }
-}
-
-/// Runs a connection until the process ends, reconnecting on any failure with
-/// capped exponential backoff. Credentials are validated before any of these
-/// are spawned, so every failure here is worth retrying.
-pub async fn run(id: usize, symbols: Arc<Vec<String>>, depth: u32, shared: Arc<Shared>) {
+/// Runs the connection until the process ends, reconnecting on any failure
+/// with capped exponential backoff. Credentials are validated before this is
+/// spawned, so every failure here is worth retrying.
+pub async fn run(symbols: Arc<Vec<String>>, depth: u32, shared: Arc<Shared>) {
     let mut delay = RECONNECT_DELAY_MIN;
     loop {
         let started = Instant::now();
@@ -103,11 +64,11 @@ pub async fn run(id: usize, symbols: Arc<Vec<String>>, depth: u32, shared: Arc<S
         // A token is good for 15 minutes before use, so take a fresh one per
         // attempt rather than holding one across a long outage.
         match auth::websockets_token(&shared.http, &shared.creds).await {
-            Ok(token) => match session(id, &symbols, depth, &token, &shared).await {
-                Ok(()) => eprintln!("[conn {id}] closed by peer, reconnecting"),
-                Err(error) => eprintln!("[conn {id}] {error:#}, reconnecting"),
+            Ok(token) => match session(&symbols, depth, &token, &shared).await {
+                Ok(()) => eprintln!("connection closed by peer, reconnecting"),
+                Err(error) => eprintln!("{error:#}, reconnecting"),
             },
-            Err(error) => eprintln!("[conn {id}] {error:#}, retrying"),
+            Err(error) => eprintln!("{error:#}, retrying"),
         }
         shared.stats.note_disconnect();
 
@@ -120,42 +81,31 @@ pub async fn run(id: usize, symbols: Arc<Vec<String>>, depth: u32, shared: Arc<S
 }
 
 async fn session(
-    id: usize,
     symbols: &[String],
     depth: u32,
     token: &str,
     shared: &Arc<Shared>,
 ) -> Result<()> {
-    let (socket, _) = tokio_tungstenite::connect_async(WS_URL)
+    let (mut socket, _) = tokio_tungstenite::connect_async(WS_URL)
         .await
         .with_context(|| format!("connect to {WS_URL}"))?;
-    eprintln!("[conn {id}] connected, subscribing to {} symbols", symbols.len());
+    eprintln!("connected, subscribing to {} symbols", symbols.len());
 
-    let (mut sink, mut stream) = socket.split();
-
-    // Subscribe from a separate task so the reader keeps draining while the
-    // batches are paced out; snapshots start arriving before the last batch
-    // is sent and would otherwise fill the socket buffer.
-    let requests = subscribe_requests(symbols, depth, token);
-    let pace = Arc::clone(shared);
-    let subscriber = tokio::spawn(async move {
-        for request in requests {
-            pace.pacer.wait().await;
-            if sink.send(Message::Text(request.into())).await.is_err() {
-                return;
-            }
-        }
-    });
-    // Cancelling on the way out closes the sink, which closes the connection.
-    let _guard = AbortOnDrop(subscriber);
+    // One request subscribes everything; its rate-limit cost is what caps
+    // --symbols (see main.rs).
+    let request = subscribe_request(symbols, depth, token);
+    socket
+        .send(Message::Text(request.into()))
+        .await
+        .context("send subscribe request")?;
 
     loop {
-        let message = timeout(STALL_TIMEOUT, stream.next())
+        let message = timeout(STALL_TIMEOUT, socket.next())
             .await
             .map_err(|_| anyhow::anyhow!("no message for {STALL_TIMEOUT:?}"))?;
 
         match message {
-            Some(Ok(Message::Text(text))) => handle(id, text.as_str(), shared).await?,
+            Some(Ok(Message::Text(text))) => handle(text.as_str(), shared).await?,
             Some(Ok(Message::Close(frame))) => {
                 bail!("server closed the connection: {frame:?}");
             }
@@ -167,31 +117,19 @@ async fn session(
     }
 }
 
-/// Splits the symbols into subscribe requests small enough that one request
-/// per second stays inside the global pacer's budget.
-fn subscribe_requests(symbols: &[String], depth: u32, token: &str) -> Vec<String> {
-    // Half the standard tier's 200/second, to leave room for a shared key.
-    const BUDGET_PER_SECOND: u32 = 100;
-    let batch = (BUDGET_PER_SECOND / subscribe_cost(depth)).max(1) as usize;
-
-    symbols
-        .chunks(batch)
-        .enumerate()
-        .map(|(index, chunk)| {
-            let request = SubscribeRequest {
-                method: "subscribe",
-                req_id: index as u64 + 1,
-                params: SubscribeParams {
-                    channel: "level3",
-                    symbol: chunk,
-                    depth,
-                    snapshot: true,
-                    token,
-                },
-            };
-            serde_json::to_string(&request).expect("subscribe request is serializable")
-        })
-        .collect()
+fn subscribe_request(symbols: &[String], depth: u32, token: &str) -> String {
+    let request = SubscribeRequest {
+        method: "subscribe",
+        req_id: 1,
+        params: SubscribeParams {
+            channel: "level3",
+            symbol: symbols,
+            depth,
+            snapshot: true,
+            token,
+        },
+    };
+    serde_json::to_string(&request).expect("subscribe request is serializable")
 }
 
 #[derive(serde::Serialize)]
@@ -262,14 +200,14 @@ enum EventKind {
     Delete,
 }
 
-async fn handle(id: usize, text: &str, shared: &Arc<Shared>) -> Result<()> {
+async fn handle(text: &str, shared: &Arc<Shared>) -> Result<()> {
     let stats = &shared.stats;
     stats.note_bytes(text.len() as u64);
 
     let message: Inbound = match serde_json::from_str(text) {
         Ok(message) => message,
         Err(error) => {
-            eprintln!("[conn {id}] unparseable message: {error}");
+            eprintln!("unparseable message: {error}");
             return Ok(());
         }
     };
@@ -277,7 +215,7 @@ async fn handle(id: usize, text: &str, shared: &Arc<Shared>) -> Result<()> {
     if message.method == Some("subscribe") {
         if message.success == Some(false) {
             eprintln!(
-                "[conn {id}] subscribe rejected: {}",
+                "subscribe rejected: {}",
                 message.error.as_deref().unwrap_or("unknown error")
             );
             stats.note_subscribe_failure();
@@ -380,13 +318,4 @@ async fn forward(shared: &Arc<Shared>, mut order: wire::Order) -> Result<()> {
         .send(order.encode())
         .await
         .map_err(|_| anyhow::anyhow!("publisher stopped"))
-}
-
-/// Aborts a task when it goes out of scope.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }

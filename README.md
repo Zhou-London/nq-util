@@ -37,10 +37,11 @@ Homebrew — `/opt/homebrew/opt/rustup/bin` must be on `PATH`).
 
 ### md/kraken
 
-Reads Kraken's spot `level3` (L3 orders) websocket feed — every online crypto
-pair by default — normalizes each order event onto the nlib wire, and
-publishes the framed records over ZMQ for `nqbook`'s feed thread. Needs a
-Kraken API key pair; see [md/kraken/README.md](md/kraken/README.md).
+Reads Kraken's spot `level3` (L3 orders) websocket feed for the most actively
+traded crypto pairs (35 by default, one connection), normalizes each order
+event onto the nlib wire, and publishes the framed records over ZMQ for
+`nqbook`'s feed thread. Needs a Kraken API key pair; see
+[md/kraken/README.md](md/kraken/README.md).
 
 ```bash
 cd md/kraken && cargo run --release   # PUB on tcp://0.0.0.0:5555
