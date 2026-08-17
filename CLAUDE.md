@@ -12,7 +12,7 @@ dependencies and is built its own way. See [README.md](README.md).
 
 ```
 feed_sim.py       ZMQ publisher that feeds nqbook a repeated virtual order
-md/kraken/        Rust: reads Kraken's spot level3 websocket feed and discards it
+md/kraken/        Rust: normalizes Kraken's spot level3 feed onto the nlib wire and publishes it over ZMQ
 ```
 
 Everything here runs on the **host**, not in the `dev` container — that is what
@@ -40,15 +40,17 @@ Module-level `//!` comments carry the contract: what the module is responsible
 for, and the protocol or rate-limit rule it encodes. Keep them accurate when
 the behavior changes — they are the documentation.
 
-## feed_sim.py encodes nqbook's wire format
+## Two files encode nqbook's wire format
 
-`ORDER_FORMAT` is a hand-written `struct` layout of `nlib::order`, and the tag
-byte matches `kOrderTag` in `nqbook`'s `Pipeline.h`. Nothing checks the two
-against each other: a field added to `nlib::order` makes the simulator send
-frames that `RunFeed` silently drops as the wrong size.
+`feed_sim.py`'s `ORDER_FORMAT` and `md/kraken/src/wire.rs` are hand-written
+layouts of `nlib::order`, and the tag byte matches `kOrderTag` in `nqbook`'s
+`Pipeline.h`. Nothing checks them against the C++ header: a field added to
+`nlib::order` makes both publishers send frames that `RunFeed` silently drops
+as the wrong size.
 
 So when `common.h` changes in [nlib](https://github.com/Zhou-London/nlib),
-update `ORDER_FORMAT` and its `assert` on the packed size in the same change.
+update `ORDER_FORMAT` (and its `assert` on the packed size), `wire.rs`'s
+`encode` offsets, and the layout test in the same change.
 
 ## Credentials
 

@@ -1,4 +1,5 @@
-//! Counters over the discarded feed, shared by every connection.
+//! Counters over the normalized feed, shared by every connection and the
+//! publisher.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,6 +13,8 @@ pub struct Stats {
     deletes: AtomicU64,
     orders: AtomicU64,
     bytes: AtomicU64,
+    published: AtomicU64,
+    norm_errors: AtomicU64,
     disconnects: AtomicU64,
     subscribe_failures: AtomicU64,
 }
@@ -25,6 +28,8 @@ pub struct Snapshot {
     pub deletes: u64,
     pub orders: u64,
     pub bytes: u64,
+    pub published: u64,
+    pub norm_errors: u64,
     pub disconnects: u64,
     pub subscribe_failures: u64,
 }
@@ -39,23 +44,23 @@ impl Stats {
         self.orders.fetch_add(orders, Ordering::Relaxed);
     }
 
-    /// Records one update message and tallies its order events by kind.
-    pub fn note_update(&self, events: impl Iterator<Item = Option<EventKind>>) {
-        let (mut adds, mut modifies, mut deletes, mut total) = (0, 0, 0, 0);
-        for event in events {
-            total += 1;
-            match event {
-                Some(EventKind::Add) => adds += 1,
-                Some(EventKind::Modify) => modifies += 1,
-                Some(EventKind::Delete) => deletes += 1,
-                None => {}
-            }
-        }
+    /// Records one update message and its order events by kind.
+    pub fn note_update(&self, adds: u64, modifies: u64, deletes: u64) {
         self.updates.fetch_add(1, Ordering::Relaxed);
-        self.orders.fetch_add(total, Ordering::Relaxed);
+        self.orders.fetch_add(adds + modifies + deletes, Ordering::Relaxed);
         self.adds.fetch_add(adds, Ordering::Relaxed);
         self.modifies.fetch_add(modifies, Ordering::Relaxed);
         self.deletes.fetch_add(deletes, Ordering::Relaxed);
+    }
+
+    /// Records one frame handed to the PUB socket.
+    pub fn note_published(&self) {
+        self.published.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one order event dropped because a field failed to normalize.
+    pub fn note_norm_error(&self) {
+        self.norm_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn note_disconnect(&self) {
@@ -75,20 +80,12 @@ impl Stats {
             deletes: self.deletes.load(Ordering::Relaxed),
             orders: self.orders.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
+            published: self.published.load(Ordering::Relaxed),
+            norm_errors: self.norm_errors.load(Ordering::Relaxed),
             disconnects: self.disconnects.load(Ordering::Relaxed),
             subscribe_failures: self.subscribe_failures.load(Ordering::Relaxed),
         }
     }
-}
-
-/// What an order in a `level3` update did. Absent in a snapshot, where every
-/// order is simply present.
-#[derive(serde::Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum EventKind {
-    Add,
-    Modify,
-    Delete,
 }
 
 impl Snapshot {
@@ -97,14 +94,16 @@ impl Snapshot {
         let secs = elapsed.as_secs_f64().max(f64::EPSILON);
         let updates = self.updates - previous.updates;
         let orders = self.orders - previous.orders;
+        let published = self.published - previous.published;
         let bytes = self.bytes - previous.bytes;
 
         let mut line = format!(
-            "{:>8.0} msg/s  {:>9.0} order/s  {:>7.2} MB/s  |  \
+            "{:>8.0} msg/s  {:>9.0} order/s  {:>9.0} pub/s  {:>7.2} MB/s  |  \
              total {} snapshots, {} updates, {} orders \
-             (+{} add, ~{} mod, -{} del)",
+             (+{} add, ~{} mod, -{} del), {} published",
             updates as f64 / secs,
             orders as f64 / secs,
+            published as f64 / secs,
             bytes as f64 / secs / (1 << 20) as f64,
             self.snapshots,
             self.updates,
@@ -112,11 +111,12 @@ impl Snapshot {
             self.adds,
             self.modifies,
             self.deletes,
+            self.published,
         );
-        if self.disconnects > 0 || self.subscribe_failures > 0 {
+        if self.disconnects > 0 || self.subscribe_failures > 0 || self.norm_errors > 0 {
             line.push_str(&format!(
-                "  |  {} disconnects, {} subscribe failures",
-                self.disconnects, self.subscribe_failures
+                "  |  {} disconnects, {} subscribe failures, {} normalize errors",
+                self.disconnects, self.subscribe_failures, self.norm_errors
             ));
         }
         line

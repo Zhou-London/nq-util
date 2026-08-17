@@ -1,4 +1,5 @@
-//! Selects which pairs to subscribe to, ranked by traded volume.
+//! Selects which pairs to subscribe to: every online spot pair whose base is
+//! a cryptoasset, over any quote currency, ranked by activity.
 
 use std::collections::HashMap;
 
@@ -10,9 +11,6 @@ const REST_BASE: &str = "https://api.kraken.com";
 /// Kraken's classic asset codes prefix fiat with `Z` (`ZUSD`, `ZEUR`). Pairs
 /// whose base is fiat are FX crosses, not crypto, so they are excluded.
 const FIAT_PREFIX: char = 'Z';
-
-/// The quote asset to rank against; USD books carry most of Kraken's volume.
-const QUOTE: &str = "ZUSD";
 
 #[derive(Deserialize)]
 struct Envelope<T> {
@@ -27,58 +25,62 @@ struct AssetPair {
     /// that are not offered over websocket.
     wsname: Option<String>,
     base: String,
-    quote: String,
     status: String,
 }
 
 #[derive(Deserialize)]
 struct Ticker {
-    /// `[today, last 24 hours]` traded volume, in base units.
-    v: [String; 2],
-    /// `[today, last 24 hours]` volume-weighted average price.
-    p: [String; 2],
+    /// `[today, last 24 hours]` trade count. Unlike volume, which is priced
+    /// in each pair's own quote currency, a trade count compares across
+    /// quotes, so one ranking can cover the whole exchange.
+    t: [u64; 2],
 }
 
-/// Returns the `limit` most active online crypto/USD pairs as websocket names,
-/// most traded first, ranked by 24-hour volume valued at that day's VWAP.
-pub async fn most_active(http: &reqwest::Client, limit: usize) -> Result<Vec<String>> {
+/// Returns the online crypto spot pairs as websocket names, most actively
+/// traded first by 24-hour trade count, all of them when `limit` is None.
+pub async fn select(http: &reqwest::Client, limit: Option<usize>) -> Result<Vec<String>> {
     let pairs: HashMap<String, AssetPair> = get(http, "/0/public/AssetPairs").await?;
     let tickers: HashMap<String, Ticker> = get(http, "/0/public/Ticker").await?;
 
-    let mut ranked: Vec<(f64, String)> = pairs
+    let mut ranked: Vec<(u64, String)> = pairs
         .iter()
         .filter(|(_, pair)| {
             pair.status == "online"
-                && pair.quote == QUOTE
                 && !pair.base.starts_with(FIAT_PREFIX)
                 && pair.wsname.is_some()
         })
-        .filter_map(|(id, pair)| {
-            let ticker = tickers.get(id)?;
-            let volume: f64 = ticker.v[1].parse().ok()?;
-            let vwap: f64 = ticker.p[1].parse().ok()?;
-            let notional = volume * vwap;
+        .map(|(id, pair)| {
+            let trades = tickers.get(id).map_or(0, |ticker| ticker.t[1]);
             let name = websocket_v2_name(pair.wsname.as_deref().expect("filtered above"));
-            (notional > 0.0).then_some((notional, name))
+            (trades, name)
         })
         .collect();
 
     if ranked.is_empty() {
-        bail!("no tradeable {QUOTE} pairs found");
+        bail!("no tradeable pairs found");
     }
-    ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-    ranked.truncate(limit);
+    ranked.sort_unstable_by(|a, b| b.cmp(a));
+    if let Some(limit) = limit {
+        ranked.truncate(limit);
+    }
     Ok(ranked.into_iter().map(|(_, name)| name).collect())
 }
 
 /// Websocket v2 renamed two assets that `wsname` still reports under their
-/// classic codes. Subscribing under the old name is rejected with "Currency
-/// pair not supported", which would silently drop BTC and DOGE.
+/// classic codes, on either side of the pair. Subscribing under an old name
+/// is rejected with "Currency pair not supported", which would silently drop
+/// BTC and DOGE pairs and every BTC-quoted book.
 fn websocket_v2_name(wsname: &str) -> String {
+    fn asset(code: &str) -> &str {
+        match code {
+            "XBT" => "BTC",
+            "XDG" => "DOGE",
+            _ => code,
+        }
+    }
     match wsname.split_once('/') {
-        Some(("XBT", quote)) => format!("BTC/{quote}"),
-        Some(("XDG", quote)) => format!("DOGE/{quote}"),
-        _ => wsname.to_owned(),
+        Some((base, quote)) => format!("{}/{}", asset(base), asset(quote)),
+        None => wsname.to_owned(),
     }
 }
 
