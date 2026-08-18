@@ -49,6 +49,31 @@ cd md/kraken && cargo run --release   # PUB on tcp://0.0.0.0:5555
 
 ## Releases
 
+### 2026-08-17
+
+`md/kraken` stopped measuring the feed and started being it.
+
+- **Kraken level3 is normalized onto the nlib wire and published.** Every
+  order event becomes an `nlib::order` frame in one seq-ordered ZMQ PUB
+  stream: fixed-point prices and quantities parsed from the raw JSON text (no
+  float on the path), FNV-1a hashes for order ids and symbols, RFC3339 event
+  times in nanoseconds. A snapshot replays as `clear` followed by adds, so a
+  reconnect cannot leave ghost orders downstream; events that fail to
+  normalize are dropped and counted.
+- **One connection, top-N symbols.** The whole market is still ranked by
+  24-hour trade count, but the subscription takes the top `--symbols`
+  (default 35) over a single connection in one request — 175 of the standard
+  tier's 200-per-second budget, so it fits whole. The multi-connection
+  sharding, the subscribe batching, and the global pacer are gone: subscribing
+  inside the budget beats machinery for spending around it. Raise the flag as
+  the account's tier grows, up to Kraken's 200-per-connection cap.
+- **`feed_sim.py` mirrors the 72-byte `nlib::order`** — `time_ns` split into
+  `event_ns` and a trailing `recv_ns` (zeroed here; the receiver stamps it),
+  prices and quantities on the 1e10 / 1e8 scales.
+- **The nqbook dashboard passed through** as `mon/nqbook` and moved on to
+  `nqbook`'s `ui/`. A UI that serves exactly one service belongs with that
+  service, not in the host-tools repository.
+
 ### 2026-08-16
 
 The repository was split out of `nqbook` as the place for host-side tools, and
