@@ -12,7 +12,8 @@ dependencies and is built its own way. See [README.md](README.md).
 
 ```
 feed_sim.py       ZMQ publisher that feeds nqbook a repeated virtual order
-md/kraken/        Rust: normalizes Kraken's spot level3 feed onto the nlib wire and publishes it over ZMQ
+md/kraken/        Rust: normalizes Kraken's spot level3 and trade feeds onto the nlib wire and publishes them over ZMQ
+third_party/nlib  git submodule: the C++ header the wire records are generated from
 ```
 
 Everything here runs on the **host**, not in the `dev` container — that is what
@@ -40,17 +41,33 @@ Module-level `//!` comments carry the contract: what the module is responsible
 for, and the protocol or rate-limit rule it encodes. Keep them accurate when
 the behavior changes — they are the documentation.
 
-## Two files encode nqbook's wire format
+## The wire format is nlib's, not a copy of it
 
-`feed_sim.py`'s `ORDER_FORMAT` and `md/kraken/src/wire.rs` are hand-written
-layouts of `nlib::order`, and the tag byte matches `kOrderTag` in `nqbook`'s
-`Pipeline.h`. Nothing checks them against the C++ header: a field added to
-`nlib::order` makes both publishers send frames that `RunFeed` silently drops
-as the wrong size.
+`nlib` is a submodule at `third_party/nlib`, and `md/kraken/build.rs` runs
+bindgen over `third_party/nlib/include/nlib/common.h` to generate the crate's
+`nlib` module. The records the publisher sends are the C++ structs, with
+bindgen's size, alignment, and offset assertions holding them to the header.
+No layout is written down twice, and no `Default` impl exists, so every record
+is a struct literal naming every field — a field added to `common.h` reaches
+this crate as a compile error, never as frames `nqbook` drops for the wrong
+size. Frame tags match `kOrderTag` / `kTradeTag` in `nqbook`'s `Pipeline.h`.
 
-So when `common.h` changes in [nlib](https://github.com/Zhou-London/nlib),
-update `ORDER_FORMAT` (and its `assert` on the packed size), `wire.rs`'s
-`encode` offsets, and the layout test in the same change.
+`feed_sim.py`'s `ORDER_FORMAT` is the one hand-written layout left, and
+nothing checks it against the header. When `common.h` changes in
+[nlib](https://github.com/Zhou-London/nlib), commit there, bump the submodule
+(`git -C third_party/nlib fetch && git -C third_party/nlib checkout <sha>`),
+and update `ORDER_FORMAT` and its packed-size `assert` in the same change.
+
+Bindgen needs libclang, which comes with the Xcode command line tools.
+
+## A channel is a module
+
+`md/kraken/src/feed.rs` owns everything common to a websocket connection —
+connecting, subscribing, stall detection, backoff, publishing — and takes a
+`Channel`: the endpoint, whether it needs a token, and the two functions that
+build a subscribe request and normalize a message into frames. `level3.rs` and
+`trade.rs` are those two channels. A new channel is a third module of that
+shape and one more `feed::run` task in `main.rs`, not a branch inside `feed.rs`.
 
 ## Credentials
 

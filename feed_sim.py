@@ -17,12 +17,12 @@ import zmq
 
 ORDER_TAG = 0
 
-# nlib::order, little-endian LP64: seq, order_id, price, qty, event_ns
-# (int64), prev, next (uint64, zeroed; ignored on receive), instrument_id
-# (uint32), side, type, action (uint8), one pad byte, recv_ns (int64, zeroed;
-# stamped by the receiver).
-ORDER_FORMAT = struct.Struct("<qqqqqQQIBBBxq")
-assert ORDER_FORMAT.size == 72
+# nlib::order, little-endian LP64: seq, order_id, price, qty, cancel_qty,
+# new_qty, event_ns (int64), prev, next (uint64, zeroed; ignored on receive),
+# instrument_id (uint32), side, type, action (uint8), one pad byte, recv_ns
+# (int64, zeroed; stamped by the receiver).
+ORDER_FORMAT = struct.Struct("<qqqqqqqQQIBBBxq")
+assert ORDER_FORMAT.size == 88
 
 ORDER_ID = 1
 PRICE = 1_001_000_000_000  # 100.10 at nlib::price_scale (1/1e10)
@@ -55,6 +55,8 @@ def main() -> None:
                 ORDER_ID,
                 PRICE,
                 QTY,
+                0,  # cancel_qty: an add takes nothing out of the book
+                0,  # new_qty: an add sets no new remaining quantity
                 time.time_ns(),
                 0,
                 0,

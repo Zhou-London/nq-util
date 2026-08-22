@@ -27,7 +27,7 @@ pub async fn run(endpoint: String, mut rx: mpsc::Receiver<Frame>, shared: Arc<Sh
 
     while let Some(frame) = rx.recv().await {
         socket
-            .send(ZmqMessage::from(frame.to_vec()))
+            .send(ZmqMessage::from(frame.as_bytes().to_vec()))
             .await
             .context("zmq send failed")?;
         shared.stats.note_published();

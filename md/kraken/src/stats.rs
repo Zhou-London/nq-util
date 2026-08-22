@@ -12,6 +12,7 @@ pub struct Stats {
     modifies: AtomicU64,
     deletes: AtomicU64,
     orders: AtomicU64,
+    trades: AtomicU64,
     bytes: AtomicU64,
     published: AtomicU64,
     norm_errors: AtomicU64,
@@ -27,6 +28,7 @@ pub struct Snapshot {
     pub modifies: u64,
     pub deletes: u64,
     pub orders: u64,
+    pub trades: u64,
     pub bytes: u64,
     pub published: u64,
     pub norm_errors: u64,
@@ -51,6 +53,11 @@ impl Stats {
         self.adds.fetch_add(adds, Ordering::Relaxed);
         self.modifies.fetch_add(modifies, Ordering::Relaxed);
         self.deletes.fetch_add(deletes, Ordering::Relaxed);
+    }
+
+    /// Records the executions normalized out of one tape message.
+    pub fn note_trades(&self, trades: u64) {
+        self.trades.fetch_add(trades, Ordering::Relaxed);
     }
 
     /// Records one frame handed to the PUB socket.
@@ -79,6 +86,7 @@ impl Stats {
             modifies: self.modifies.load(Ordering::Relaxed),
             deletes: self.deletes.load(Ordering::Relaxed),
             orders: self.orders.load(Ordering::Relaxed),
+            trades: self.trades.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             published: self.published.load(Ordering::Relaxed),
             norm_errors: self.norm_errors.load(Ordering::Relaxed),
@@ -94,15 +102,17 @@ impl Snapshot {
         let secs = elapsed.as_secs_f64().max(f64::EPSILON);
         let updates = self.updates - previous.updates;
         let orders = self.orders - previous.orders;
+        let trades = self.trades - previous.trades;
         let published = self.published - previous.published;
         let bytes = self.bytes - previous.bytes;
 
         let mut line = format!(
-            "{:>8.0} msg/s  {:>9.0} order/s  {:>9.0} pub/s  {:>7.2} MB/s  |  \
-             total {} snapshots, {} updates, {} orders \
-             (+{} add, ~{} mod, -{} del), {} published",
+            "{:>8.0} msg/s  {:>9.0} order/s  {:>8.0} trade/s  {:>9.0} pub/s  \
+             {:>7.2} MB/s  |  total {} snapshots, {} updates, {} orders \
+             (+{} add, ~{} mod, -{} del), {} trades, {} published",
             updates as f64 / secs,
             orders as f64 / secs,
+            trades as f64 / secs,
             published as f64 / secs,
             bytes as f64 / secs / (1 << 20) as f64,
             self.snapshots,
@@ -111,6 +121,7 @@ impl Snapshot {
             self.adds,
             self.modifies,
             self.deletes,
+            self.trades,
             self.published,
         );
         if self.disconnects > 0 || self.subscribe_failures > 0 || self.norm_errors > 0 {

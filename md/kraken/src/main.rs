@@ -1,13 +1,16 @@
-//! Reads Kraken's spot `level3` (L3 orders) websocket feed for the most
-//! actively traded crypto pairs, normalizes each order event onto the nlib
-//! wire, and publishes the framed records on a ZMQ PUB socket for nqbook's
-//! feed thread.
+//! Reads Kraken's spot `level3` (L3 orders) and `trade` websocket feeds for
+//! the most actively traded crypto pairs, normalizes each event onto an
+//! `nlib::order` or `nlib::trade`, and publishes the framed records on one
+//! ZMQ PUB socket for nqbook's feed thread.
 
 mod auth;
 mod feed;
+mod level3;
+mod nlib;
 mod publish;
 mod stats;
 mod symbols;
+mod trade;
 mod wire;
 
 use std::sync::Arc;
@@ -32,7 +35,7 @@ struct Args {
     #[arg(long, default_value_t = 35, value_parser = clap::value_parser!(u16).range(1..=200))]
     symbols: u16,
 
-    /// Book depth per symbol; Kraken accepts 10, 100 or 1000.
+    /// `level3` book depth per symbol; Kraken accepts 10, 100 or 1000.
     #[arg(long, default_value_t = 10, value_parser = parse_depth)]
     depth: u32,
 
@@ -91,29 +94,40 @@ async fn main() -> Result<()> {
     });
 
     let publisher = tokio::spawn(publish::run(args.endpoint, frames_rx, Arc::clone(&shared)));
-    let connection = tokio::spawn(feed::run(
-        Arc::new(selected),
+    let symbols = Arc::new(selected);
+    let orders = tokio::spawn(feed::run(
+        level3::CHANNEL,
+        Arc::clone(&symbols),
+        args.depth,
+        Arc::clone(&shared),
+    ));
+    let trades = tokio::spawn(feed::run(
+        trade::CHANNEL,
+        symbols,
         args.depth,
         Arc::clone(&shared),
     ));
 
     let reporter = tokio::spawn(report(Arc::clone(&shared), args.report_interval));
 
-    // The connection retries forever, so a publisher failure, a panic, or
+    // The connections retry forever, so a publisher failure, a panic, or
     // Ctrl-C ends the run.
     let result = tokio::select! {
         outcome = publisher => outcome.context("publisher panicked")?,
-        outcome = connection => outcome.context("connection task panicked"),
+        outcome = orders => outcome.context("level3 connection task panicked"),
+        outcome = trades => outcome.context("trade connection task panicked"),
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
 
     reporter.abort();
     let total = shared.stats.snapshot();
     eprintln!(
-        "\ntotals: {} snapshots, {} updates, {} orders, {} published, {:.1} MB received",
+        "\ntotals: {} snapshots, {} updates, {} orders, {} trades, {} published, \
+         {:.1} MB received",
         total.snapshots,
         total.updates,
         total.orders,
+        total.trades,
         total.published,
         total.bytes as f64 / (1 << 20) as f64,
     );

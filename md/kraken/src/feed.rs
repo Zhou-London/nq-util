@@ -1,14 +1,11 @@
-//! The websocket connection: subscribe to `level3`, normalize every order
-//! event onto the nlib wire, and hand the frames to the publisher.
+//! The websocket connections. One connection per channel, each subscribing
+//! once and then normalizing every inbound message onto nlib records for the
+//! publisher.
 //!
-//! Normalization: bids are buys and asks sells; a snapshot replays as a
-//! `Clear` followed by an `Add` per resting order; update events map add ->
-//! `Add`, modify -> `Modify` (new remaining quantity, price unchanged, queue
-//! priority kept), delete -> `Cancel` (the order leaves the book). Prices and
-//! quantities are parsed from the raw JSON text into fixed point, ids and
-//! symbols hash to the wire's integer ids, and `seq` is assigned from one
-//! counter, so the ZMQ stream is a single ordered feed. An order whose
-//! fields fail to normalize is skipped and counted, never sent half-formed.
+//! A connection reconnects on any failure with capped exponential backoff,
+//! taking a fresh websocket token per attempt where the channel needs one.
+//! Both connections draw sequence numbers from one counter and feed one PUB
+//! socket, so nqbook reads a single ordered stream.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -16,18 +13,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
-use serde_json::value::RawValue;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth::{self, Credentials};
 use crate::stats::Stats;
-use crate::wire::{self, Frame};
-
-/// `level3` lives on its own endpoint, not the general authenticated one.
-const WS_URL: &str = "wss://ws-l3.kraken.com/v2";
+use crate::wire::Frame;
 
 /// Kraken sends a heartbeat about once a second when no channel is updating,
 /// so silence this long means the connection is dead however healthy the
@@ -42,7 +34,7 @@ const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 /// outage left off.
 const HEALTHY_SESSION: Duration = Duration::from_secs(120);
 
-/// State shared between the connection and the publisher.
+/// State shared between the connections and the publisher.
 pub struct Shared {
     pub creds: Credentials,
     pub http: reqwest::Client,
@@ -53,19 +45,37 @@ pub struct Shared {
     pub frames: mpsc::Sender<Frame>,
 }
 
-/// Runs the connection until the process ends, reconnecting on any failure
-/// with capped exponential backoff. Credentials are validated before this is
-/// spawned, so every failure here is worth retrying.
-pub async fn run(symbols: Arc<Vec<String>>, depth: u32, shared: Arc<Shared>) {
+impl Shared {
+    /// Takes the next feed sequence number.
+    pub fn next_seq(&self) -> i64 {
+        self.seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+/// One Kraken channel: where it is served, how it is subscribed to, and how
+/// its messages become frames. Connecting, reconnecting, stall detection and
+/// publishing are the same for every channel and live in this module.
+pub struct Channel {
+    /// Websocket endpoint serving the channel.
+    pub url: &'static str,
+    /// Whether the subscribe request carries a websocket token.
+    pub authenticated: bool,
+    /// Builds the subscribe request. `token` is empty for a public channel.
+    pub subscribe: fn(symbols: &[String], depth: u32, token: &str) -> String,
+    /// Normalizes one inbound message, appending a frame per record.
+    pub normalize: fn(text: &str, shared: &Shared, out: &mut Vec<Frame>),
+}
+
+/// Runs `channel`'s connection until the process ends, reconnecting on any
+/// failure. Credentials are validated before this is spawned, so every
+/// failure here is worth retrying.
+pub async fn run(channel: Channel, symbols: Arc<Vec<String>>, depth: u32, shared: Arc<Shared>) {
     let mut delay = RECONNECT_DELAY_MIN;
     loop {
         let started = Instant::now();
-
-        // A token is good for 15 minutes before use, so take a fresh one per
-        // attempt rather than holding one across a long outage.
-        match auth::websockets_token(&shared.http, &shared.creds).await {
-            Ok(token) => match session(&symbols, depth, &token, &shared).await {
-                Ok(()) => eprintln!("connection closed by peer, reconnecting"),
+        match token(&channel, &shared).await {
+            Ok(token) => match session(&channel, &symbols, depth, &token, &shared).await {
+                Ok(()) => eprintln!("{} closed by peer, reconnecting", channel.url),
                 Err(error) => eprintln!("{error:#}, reconnecting"),
             },
             Err(error) => eprintln!("{error:#}, retrying"),
@@ -80,242 +90,80 @@ pub async fn run(symbols: Arc<Vec<String>>, depth: u32, shared: Arc<Shared>) {
     }
 }
 
+/// A token is good for 15 minutes before use, so an authenticated channel
+/// takes a fresh one per attempt rather than holding one across a long
+/// outage. A public channel subscribes with an empty token.
+async fn token(channel: &Channel, shared: &Shared) -> Result<String> {
+    if channel.authenticated {
+        auth::websockets_token(&shared.http, &shared.creds).await
+    } else {
+        Ok(String::new())
+    }
+}
+
 async fn session(
+    channel: &Channel,
     symbols: &[String],
     depth: u32,
     token: &str,
-    shared: &Arc<Shared>,
+    shared: &Shared,
 ) -> Result<()> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(WS_URL)
+    let url = channel.url;
+    let (mut socket, _) = tokio_tungstenite::connect_async(url)
         .await
-        .with_context(|| format!("connect to {WS_URL}"))?;
-    eprintln!("connected, subscribing to {} symbols", symbols.len());
+        .with_context(|| format!("connect to {url}"))?;
+    eprintln!("connected to {url}, subscribing to {} symbols", symbols.len());
 
-    // One request subscribes everything; its rate-limit cost is what caps
+    // One request subscribes every symbol; its rate-limit cost is what caps
     // --symbols (see main.rs).
-    let request = subscribe_request(symbols, depth, token);
     socket
-        .send(Message::Text(request.into()))
+        .send(Message::Text((channel.subscribe)(symbols, depth, token).into()))
         .await
-        .context("send subscribe request")?;
+        .with_context(|| format!("send subscribe request to {url}"))?;
 
+    let mut frames = Vec::new();
     loop {
         let message = timeout(STALL_TIMEOUT, socket.next())
             .await
-            .map_err(|_| anyhow::anyhow!("no message for {STALL_TIMEOUT:?}"))?;
+            .map_err(|_| anyhow::anyhow!("{url} sent no message for {STALL_TIMEOUT:?}"))?;
 
         match message {
-            Some(Ok(Message::Text(text))) => handle(text.as_str(), shared).await?,
-            Some(Ok(Message::Close(frame))) => {
-                bail!("server closed the connection: {frame:?}");
+            Some(Ok(Message::Text(text))) => {
+                shared.stats.note_bytes(text.len() as u64);
+                (channel.normalize)(text.as_str(), shared, &mut frames);
+                for frame in frames.drain(..) {
+                    // A record is delayed rather than dropped before the PUB
+                    // socket, so the channel's capacity absorbs a burst.
+                    shared
+                        .frames
+                        .send(frame)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("publisher stopped"))?;
+                }
             }
+            Some(Ok(Message::Close(frame))) => bail!("{url} closed the connection: {frame:?}"),
             // Ping/Pong are answered by the library; Binary is never sent.
             Some(Ok(_)) => {}
-            Some(Err(error)) => return Err(error).context("websocket read failed"),
+            Some(Err(error)) => return Err(error).with_context(|| format!("{url} read failed")),
             None => return Ok(()),
         }
     }
 }
 
-fn subscribe_request(symbols: &[String], depth: u32, token: &str) -> String {
-    let request = SubscribeRequest {
-        method: "subscribe",
-        req_id: 1,
-        params: SubscribeParams {
-            channel: "level3",
-            symbol: symbols,
-            depth,
-            snapshot: true,
-            token,
-        },
-    };
-    serde_json::to_string(&request).expect("subscribe request is serializable")
-}
-
-#[derive(serde::Serialize)]
-struct SubscribeRequest<'a> {
-    method: &'a str,
-    req_id: u64,
-    params: SubscribeParams<'a>,
-}
-
-#[derive(serde::Serialize)]
-struct SubscribeParams<'a> {
-    channel: &'a str,
-    symbol: &'a [String],
-    depth: u32,
-    snapshot: bool,
-    token: &'a str,
-}
-
-/// The fields of an inbound message this client reads. Prices and quantities
-/// are kept as raw JSON text so fixed-point conversion is exact.
-#[derive(Deserialize)]
-struct Inbound<'a> {
-    #[serde(borrow, default)]
-    channel: Option<&'a str>,
-    #[serde(borrow, default, rename = "type")]
-    kind: Option<&'a str>,
-    #[serde(borrow, default)]
-    method: Option<&'a str>,
-    #[serde(default)]
+/// Reports a rejected subscribe request. Returns whether the message is a
+/// subscribe reply, which carries no channel data.
+pub fn subscribe_reply(
+    method: Option<&str>,
     success: Option<bool>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    data: Vec<Book<'a>>,
-}
-
-#[derive(Deserialize)]
-struct Book<'a> {
-    #[serde(borrow, default)]
-    symbol: Option<&'a str>,
-    #[serde(borrow, default)]
-    bids: Vec<OrderMsg<'a>>,
-    #[serde(borrow, default)]
-    asks: Vec<OrderMsg<'a>>,
-}
-
-#[derive(Deserialize)]
-struct OrderMsg<'a> {
-    #[serde(default)]
-    event: Option<EventKind>,
-    #[serde(borrow)]
-    order_id: &'a str,
-    #[serde(borrow)]
-    limit_price: &'a RawValue,
-    #[serde(borrow)]
-    order_qty: &'a RawValue,
-    #[serde(borrow)]
-    timestamp: &'a str,
-}
-
-/// What an order in a `level3` update did. Absent in a snapshot, where every
-/// order is simply present.
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-enum EventKind {
-    Add,
-    Modify,
-    Delete,
-}
-
-async fn handle(text: &str, shared: &Arc<Shared>) -> Result<()> {
-    let stats = &shared.stats;
-    stats.note_bytes(text.len() as u64);
-
-    let message: Inbound = match serde_json::from_str(text) {
-        Ok(message) => message,
-        Err(error) => {
-            eprintln!("unparseable message: {error}");
-            return Ok(());
-        }
-    };
-
-    if message.method == Some("subscribe") {
-        if message.success == Some(false) {
-            eprintln!(
-                "subscribe rejected: {}",
-                message.error.as_deref().unwrap_or("unknown error")
-            );
-            stats.note_subscribe_failure();
-        }
-        return Ok(());
+    error: Option<&str>,
+    stats: &Stats,
+) -> bool {
+    if method != Some("subscribe") {
+        return false;
     }
-    if message.channel != Some("level3") {
-        return Ok(());
+    if success == Some(false) {
+        eprintln!("subscribe rejected: {}", error.unwrap_or("unknown error"));
+        stats.note_subscribe_failure();
     }
-
-    let snapshot = match message.kind {
-        Some("snapshot") => true,
-        Some("update") => false,
-        _ => return Ok(()),
-    };
-    for book in &message.data {
-        let Some(symbol) = book.symbol else {
-            stats.note_norm_error();
-            continue;
-        };
-        let instrument_id = wire::instrument_id(symbol);
-
-        // Normalize the whole message before sending any of it: a snapshot's
-        // Clear carries the newest event time its orders replay up to.
-        let mut orders = Vec::with_capacity(book.bids.len() + book.asks.len() + 1);
-        let (mut adds, mut modifies, mut deletes) = (0, 0, 0);
-        for (side, msgs) in [(wire::Side::Buy, &book.bids), (wire::Side::Sell, &book.asks)] {
-            for msg in msgs {
-                let action = match (snapshot, msg.event) {
-                    (true, _) => wire::Action::Add,
-                    (false, Some(EventKind::Add)) => wire::Action::Add,
-                    (false, Some(EventKind::Modify)) => wire::Action::Modify,
-                    (false, Some(EventKind::Delete)) => wire::Action::Cancel,
-                    (false, None) => {
-                        stats.note_norm_error();
-                        continue;
-                    }
-                };
-                let normalized = (
-                    wire::scaled(msg.limit_price.get(), wire::PRICE_DECIMALS),
-                    wire::scaled(msg.order_qty.get(), wire::QTY_DECIMALS),
-                    wire::event_ns(msg.timestamp),
-                );
-                let (Some(price), Some(qty), Some(event_ns)) = normalized else {
-                    stats.note_norm_error();
-                    continue;
-                };
-                match action {
-                    wire::Action::Add => adds += 1,
-                    wire::Action::Modify => modifies += 1,
-                    _ => deletes += 1,
-                }
-                orders.push(wire::Order {
-                    seq: 0, // assigned at send, after the Clear takes its slot
-                    order_id: wire::order_id(msg.order_id),
-                    price,
-                    qty,
-                    event_ns,
-                    instrument_id,
-                    side,
-                    action,
-                });
-            }
-        }
-
-        if snapshot {
-            let event_ns = orders.iter().map(|o| o.event_ns).max().unwrap_or(0);
-            forward(
-                shared,
-                wire::Order {
-                    seq: 0,
-                    order_id: 0,
-                    price: 0,
-                    qty: 0,
-                    event_ns,
-                    instrument_id,
-                    side: wire::Side::Buy,
-                    action: wire::Action::Clear,
-                },
-            )
-            .await?;
-            stats.note_snapshot(orders.len() as u64);
-        } else {
-            stats.note_update(adds, modifies, deletes);
-        }
-        for order in orders {
-            forward(shared, order).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Stamps `order` with the next sequence number and queues its frame for the
-/// publisher, waiting while the channel is full; a record is delayed, never
-/// dropped, before the PUB socket.
-async fn forward(shared: &Arc<Shared>, mut order: wire::Order) -> Result<()> {
-    order.seq = shared.seq.fetch_add(1, Ordering::Relaxed) + 1;
-    shared
-        .frames
-        .send(order.encode())
-        .await
-        .map_err(|_| anyhow::anyhow!("publisher stopped"))
+    true
 }

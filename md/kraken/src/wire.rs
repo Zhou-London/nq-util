@@ -1,70 +1,66 @@
-//! The nlib wire image: `nlib::order` serialized byte for byte (little-endian
-//! LP64) behind nqbook's one-byte frame tag, plus the rules that normalize
-//! Kraken's level3 fields onto it. The layout mirrors nlib's `common.h`,
-//! whose static_asserts pin the same 72-byte size; the tests here are the
-//! Rust half of that contract.
+//! Framing for the nlib wire records, and the conversions Kraken's JSON needs
+//! to reach them: fixed-point decimals, RFC3339 timestamps, and the hashes
+//! that map Kraken's string ids onto the wire's integers.
+//!
+//! A frame is nqbook's one tag byte followed by the record's own bytes in
+//! host layout. The records come from `common.h` through [`crate::nlib`], so
+//! the layout on the wire is the C++ struct's.
 
-/// Fixed-point decimals, matching nlib's `price_scale` and `qty_scale`.
-pub const PRICE_DECIMALS: i32 = 10;
-pub const QTY_DECIMALS: i32 = 8;
+use crate::nlib;
 
-/// nqbook's frame tag for an order record.
-const ORDER_TAG: u8 = 0;
+/// Fixed-point decimals, read off nlib's scales.
+pub const PRICE_DECIMALS: i32 = nlib::price_scale.ilog10() as i32;
+pub const QTY_DECIMALS: i32 = nlib::qty_scale.ilog10() as i32;
 
-/// One tag byte plus the 72-byte `nlib::order`.
-pub const ORDER_FRAME_LEN: usize = 73;
+/// A record nqbook's `RunFeed` decodes, with the frame tag that selects it —
+/// `kOrderTag` and `kTradeTag` in nqbook's `Pipeline.h`.
+pub trait Record: Copy {
+    const TAG: u8;
+}
+
+impl Record for nlib::order {
+    const TAG: u8 = 0;
+}
+
+impl Record for nlib::trade {
+    const TAG: u8 = 1;
+}
+
+/// Buffer sized for the larger record, so one frame type carries both.
+const CAPACITY: usize = 1 + if size_of::<nlib::order>() > size_of::<nlib::trade>() {
+    size_of::<nlib::order>()
+} else {
+    size_of::<nlib::trade>()
+};
 
 /// One framed record, ready for the PUB socket.
-pub type Frame = [u8; ORDER_FRAME_LEN];
-
-/// `nlib::side` codes.
 #[derive(Clone, Copy)]
-pub enum Side {
-    Buy = 0,
-    Sell = 1,
+pub struct Frame {
+    bytes: [u8; CAPACITY],
+    len: usize,
 }
 
-/// `nlib::order_action` codes. `qty` means: for `Add`, the resting quantity;
-/// for `Cancel`, the remaining quantity leaving the book; for `Modify`, the
-/// new remaining quantity. `Clear` drops the instrument's resting orders
-/// ahead of a snapshot replay.
-#[derive(Clone, Copy)]
-pub enum Action {
-    Add = 0,
-    Cancel = 1,
-    Modify = 2,
-    Clear = 3,
-}
+impl Frame {
+    /// Frames `record` byte for byte behind its tag. nlib's records are
+    /// trivially copyable and standard layout — `common.h` asserts both — so
+    /// their object representation is the wire image.
+    pub fn new<T: Record>(record: T) -> Self {
+        let mut frame = Self {
+            bytes: [0; CAPACITY],
+            len: 1 + size_of::<T>(),
+        };
+        frame.bytes[0] = T::TAG;
+        // SAFETY: the buffer is sized for the larger record, so `T` fits past
+        // the tag byte; the write is unaligned, so the tag's offset places no
+        // constraint on it.
+        unsafe {
+            std::ptr::write_unaligned(frame.bytes.as_mut_ptr().add(1).cast::<T>(), record);
+        }
+        frame
+    }
 
-/// One normalized order event in `nlib::order` field order.
-pub struct Order {
-    pub seq: i64,
-    pub order_id: i64,
-    pub price: i64,
-    pub qty: i64,
-    pub event_ns: i64,
-    pub instrument_id: u32,
-    pub side: Side,
-    pub action: Action,
-}
-
-impl Order {
-    /// Encodes the frame nqbook's `RunFeed` decodes. The order type is always
-    /// limit (only limit orders rest in a level3 book); the intrusive hooks
-    /// and `recv_ns` stay zero — the hooks are book-owned and the receive
-    /// time is stamped by the receiving process.
-    pub fn encode(&self) -> Frame {
-        let mut f = [0u8; ORDER_FRAME_LEN];
-        f[0] = ORDER_TAG;
-        f[1..9].copy_from_slice(&self.seq.to_le_bytes());
-        f[9..17].copy_from_slice(&self.order_id.to_le_bytes());
-        f[17..25].copy_from_slice(&self.price.to_le_bytes());
-        f[25..33].copy_from_slice(&self.qty.to_le_bytes());
-        f[33..41].copy_from_slice(&self.event_ns.to_le_bytes());
-        f[57..61].copy_from_slice(&self.instrument_id.to_le_bytes());
-        f[61] = self.side as u8;
-        f[63] = self.action as u8;
-        f
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
 }
 
@@ -168,32 +164,77 @@ pub fn event_ns(timestamp: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// Reads a record back out of the frame it was written into.
+    fn decode<T: Record>(frame: &Frame) -> T {
+        assert_eq!(frame.as_bytes().len(), 1 + size_of::<T>());
+        assert_eq!(frame.as_bytes()[0], T::TAG);
+        // SAFETY: the frame holds exactly one `T` past the tag byte, checked
+        // above; the read is unaligned for the same reason the write is.
+        unsafe { std::ptr::read_unaligned(frame.as_bytes()[1..].as_ptr().cast::<T>()) }
+    }
+
     #[test]
-    fn encode_layout_matches_nlib_order() {
-        let frame = Order {
-            seq: 0x0102030405060708,
-            order_id: 0x1112131415161718,
-            price: 0x2122232425262728,
-            qty: 0x3132333435363738,
-            event_ns: 0x4142434445464748,
-            instrument_id: 0x51525354,
-            side: Side::Sell,
-            action: Action::Modify,
-        }
-        .encode();
-        assert_eq!(frame.len(), 1 + 72);
-        assert_eq!(frame[0], ORDER_TAG);
-        assert_eq!(frame[1..9], 0x0102030405060708i64.to_le_bytes());
-        assert_eq!(frame[9..17], 0x1112131415161718i64.to_le_bytes());
-        assert_eq!(frame[17..25], 0x2122232425262728i64.to_le_bytes());
-        assert_eq!(frame[25..33], 0x3132333435363738i64.to_le_bytes());
-        assert_eq!(frame[33..41], 0x4142434445464748i64.to_le_bytes());
-        assert_eq!(frame[41..57], [0; 16]); // prev/next hooks
-        assert_eq!(frame[57..61], 0x51525354u32.to_le_bytes());
-        assert_eq!(frame[61], 1); // side::sell
-        assert_eq!(frame[62], 0); // order_type::limit
-        assert_eq!(frame[63], 2); // order_action::modify
-        assert_eq!(frame[64..73], [0; 9]); // padding + recv_ns
+    fn order_frames_carry_every_field() {
+        let order = nlib::order {
+            seq: 1,
+            order_id: 2,
+            price: 3,
+            qty: 4,
+            cancel_qty: 5,
+            new_qty: 6,
+            event_ns: 7,
+            prev: std::ptr::null_mut(),
+            next: std::ptr::null_mut(),
+            instrument_id: 8,
+            side: nlib::side::sell,
+            type_: nlib::order_type::limit,
+            action: nlib::order_action::modify,
+            recv_ns: 9,
+        };
+        let decoded: nlib::order = decode(&Frame::new(order));
+        assert_eq!(decoded.seq, 1);
+        assert_eq!(decoded.order_id, 2);
+        assert_eq!(decoded.price, 3);
+        assert_eq!(decoded.qty, 4);
+        assert_eq!(decoded.cancel_qty, 5);
+        assert_eq!(decoded.new_qty, 6);
+        assert_eq!(decoded.event_ns, 7);
+        assert_eq!(decoded.instrument_id, 8);
+        assert_eq!(decoded.side, nlib::side::sell);
+        assert_eq!(decoded.type_, nlib::order_type::limit);
+        assert_eq!(decoded.action, nlib::order_action::modify);
+        assert_eq!(decoded.recv_ns, 9);
+    }
+
+    #[test]
+    fn trade_frames_carry_every_field() {
+        let trade = nlib::trade {
+            seq: 1,
+            buy_order_id: 2,
+            sell_order_id: 3,
+            price: 4,
+            qty: 5,
+            event_ns: 6,
+            instrument_id: 7,
+            side: nlib::side::buy,
+            recv_ns: 8,
+        };
+        let decoded: nlib::trade = decode(&Frame::new(trade));
+        assert_eq!(decoded.seq, 1);
+        assert_eq!(decoded.buy_order_id, 2);
+        assert_eq!(decoded.sell_order_id, 3);
+        assert_eq!(decoded.price, 4);
+        assert_eq!(decoded.qty, 5);
+        assert_eq!(decoded.event_ns, 6);
+        assert_eq!(decoded.instrument_id, 7);
+        assert_eq!(decoded.side, nlib::side::buy);
+        assert_eq!(decoded.recv_ns, 8);
+    }
+
+    #[test]
+    fn decimals_follow_nlib_scales() {
+        assert_eq!(PRICE_DECIMALS, 10);
+        assert_eq!(QTY_DECIMALS, 8);
     }
 
     #[test]
